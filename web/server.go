@@ -7,6 +7,7 @@ import (
   //"html"
 	"log"
 	"net/http"
+  "sort"
 	"strconv"
   "strings"
 	"time"
@@ -39,10 +40,21 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 }
 
 type FileTree struct {
+  // For now we use repo:path format. Name for backwards compatibility.
+  // Should be unique.
   KytheUri string  `json:"kytheUri"`
+
+  // The name displayed in the tree - either a repository, or a path component.
   Display string   `json:"display"`
+
+  // Usually generated files are not indexed in Zoekt, only source.
   OnlyGenerated bool  `json:"onlyGenerated"`
-  Terminal bool `json:"terminal"`
+
+  // True if file, false if directory.
+  IsFile bool `json:"isFile"`
+
+  // nil means unknown, client should make a further request to discover.
+  // only meaningful for directories.
   Children *[]FileTree `json:"children"`
 }
 
@@ -57,6 +69,7 @@ func (s *Server) serveFileTree(w http.ResponseWriter, r *http.Request) {
    That, together with repo filter, could work...
 */
 func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error {
+  // Assumption: all paths (in request, in Zoekt response) are normalized.
   log.Printf("request: %v", r.URL)
   top := ""
   if tops, ok := r.URL.Query()["top"]; ok {
@@ -117,7 +130,7 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
         KytheUri: r,
         Display: r,
         OnlyGenerated: false,
-        Terminal: false,
+        IsFile: false,
         Children: nil,
       }
       subtrees = append(subtrees, t)
@@ -132,18 +145,33 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
       relative := strings.TrimPrefix(f.FileName, prefix)
       relParts := strings.Split(relative, "/")
       currentPart := relParts[0]
+      // Note: Zoekt won't return a sole directory as a match, only some files
+      // within a directory. This also implies that any directory we encounter
+      // will be non-empty.
+      isFile := len(relParts) == 1
       if _, exists := seen[currentPart]; !exists {
         seen[currentPart] = true
         t := FileTree{
           KytheUri: f.Repository + ":" + prefix + currentPart,
           Display: currentPart,
           OnlyGenerated: false,
-          Terminal: false,
+          IsFile: isFile,
+          // Note: as we query all files below 'top' now, we could as well
+          // eagerly build the full subtree. That might be a future option.
           Children: nil,
         }
         subtrees = append(subtrees, t)
       }
     }
+    sort.Slice(subtrees, func(i, j int) bool {
+      if subtrees[i].IsFile != subtrees[j].IsFile {
+        return subtrees[j].IsFile
+      }
+      if subtrees[i].Display < subtrees[j].Display {
+        return true
+      }
+      return false
+    })
   }
 
   w.Header().Set("Content-Type", "application/json; charset=UTF-8")
@@ -152,7 +180,7 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
     KytheUri: "toplevel",
     Display: "wontshow",
     OnlyGenerated: false,
-    Terminal: false,
+    IsFile: false,
     Children: &subtrees,
   }); err != nil {
     return err
