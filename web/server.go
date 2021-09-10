@@ -2,14 +2,14 @@ package web
 
 import (
 	"bytes"
-  "encoding/json"
+	"encoding/json"
 	"fmt"
-  //"html"
+	//"html"
 	"log"
 	"net/http"
-  "sort"
+	"sort"
 	"strconv"
-  "strings"
+	"strings"
 	"time"
 
 	//"golang.org/x/net/context"
@@ -23,10 +23,10 @@ const defaultNumResults = 50
 type Server struct {
 	Searcher zoekt.Searcher
 
-  // Version string for this server.
+	// Version string for this server.
 	Version string
 
-  startTime time.Time
+	startTime time.Time
 }
 
 func NewMux(s *Server) (*http.ServeMux, error) {
@@ -34,32 +34,32 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", s.serveSearch)
-  mux.HandleFunc("/api/filetree", s.serveFileTree)
+	mux.HandleFunc("/api/filetree", s.serveFileTree)
 
 	return mux, nil
 }
 
 type FileTree struct {
-  // For now we use repo:path format. Name for backwards compatibility.
-  // Should be unique.
-  KytheUri string  `json:"kytheUri"`
+	// For now we use repo:path format. Name for backwards compatibility.
+	// Should be unique.
+	KytheUri string `json:"kytheUri"`
 
-  // The name displayed in the tree - either a repository, or a path component.
-  Display string   `json:"display"`
+	// The name displayed in the tree - either a repository, or a path component.
+	Display string `json:"display"`
 
-  // Usually generated files are not indexed in Zoekt, only source.
-  OnlyGenerated bool  `json:"onlyGenerated"`
+	// Usually generated files are not indexed in Zoekt, only source.
+	OnlyGenerated bool `json:"onlyGenerated"`
 
-  // True if file, false if directory.
-  IsFile bool `json:"isFile"`
+	// True if file, false if directory.
+	IsFile bool `json:"isFile"`
 
-  // nil means unknown, client should make a further request to discover.
-  // only meaningful for directories.
-  Children *[]FileTree `json:"children"`
+	// nil means unknown, client should make a further request to discover.
+	// only meaningful for directories.
+	Children *[]FileTree `json:"children"`
 }
 
 func (s *Server) serveFileTree(w http.ResponseWriter, r *http.Request) {
-  if err := s.serveFileTreeErr(w, r); err != nil {
+	if err := s.serveFileTreeErr(w, r); err != nil {
 		http.Error(w, err.Error(), http.StatusTeapot)
 	}
 }
@@ -69,130 +69,130 @@ func (s *Server) serveFileTree(w http.ResponseWriter, r *http.Request) {
    That, together with repo filter, could work...
 */
 func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error {
-  // Assumption: all paths (in request, in Zoekt response) are normalized.
-  log.Printf("request: %v", r.URL)
-  top := ""
-  if tops, ok := r.URL.Query()["top"]; ok {
-    top = tops[0]
-  }
-  topParts := strings.SplitN(top, ":", 2)
-  topRepo := ""
-  topPath := ""
-  if len(topParts) > 0 {
-    topRepo = topParts[0]
-  }
-  if len(topParts) > 1 {
-    topPath = topParts[1]
-  }
+	// Assumption: all paths (in request, in Zoekt response) are normalized.
+	log.Printf("request: %v", r.URL)
+	top := ""
+	if tops, ok := r.URL.Query()["top"]; ok {
+		top = tops[0]
+	}
+	topParts := strings.SplitN(top, ":", 2)
+	topRepo := ""
+	topPath := ""
+	if len(topParts) > 0 {
+		topRepo = topParts[0]
+	}
+	if len(topParts) > 1 {
+		topPath = topParts[1]
+	}
 
-  sOpts := zoekt.SearchOptions{
+	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
 	}
 	sOpts.SetDefaults()
-  // TODO get num estimate etc
+	// TODO get num estimate etc
 
-  ctx := r.Context()
+	ctx := r.Context()
 
-  rq := "r:"
-  if topRepo != "" {
-    rq += topRepo
-    if topPath == "" {
-      // Well, zoekt obviously doesn't return dir matches. So something like
-      //
-      //     rq += " f:^[^/]*$"
-      //
-      // wouldn't work. So fetch all files from repo now, and post-process
-      // to filter the relevant ones only.
-      //
-      // Note: we rely on getting back all files, so we can harvest the
-      // top-level dirs. Need to check the num estimates above to be sure.
-      rq += " f:^.*$"
-    } else {
-      rq += " f:^" + topPath + "/.*$"
-    }
-  }
-  log.Printf("query: %v", rq)
+	rq := "r:"
+	if topRepo != "" {
+		rq += topRepo
+		if topPath == "" {
+			// Well, zoekt obviously doesn't return dir matches. So something like
+			//
+			//     rq += " f:^[^/]*$"
+			//
+			// wouldn't work. So fetch all files from repo now, and post-process
+			// to filter the relevant ones only.
+			//
+			// Note: we rely on getting back all files, so we can harvest the
+			// top-level dirs. Need to check the num estimates above to be sure.
+			rq += " f:^.*$"
+		} else {
+			rq += " f:^" + topPath + "/.*$"
+		}
+	}
+	log.Printf("query: %v", rq)
 
-  q, err := query.Parse(rq)
+	q, err := query.Parse(rq)
 	if err != nil {
 		return err
-  }
+	}
 
 	result, err := s.Searcher.Search(ctx, q, &sOpts)
 	if err != nil {
 		return err
 	}
 
-  subtrees := []FileTree{}
-  if topRepo == "" {
-    for r, _ := range result.RepoURLs {
-      t := FileTree{
-        KytheUri: r,
-        Display: r,
-        OnlyGenerated: false,
-        IsFile: false,
-        Children: nil,
-      }
-      subtrees = append(subtrees, t)
-    }
-  } else {
-    seen := map[string]bool{}
-    for _, f := range result.Files {
-      prefix := ""
-      if topPath != "" {
-        prefix = topPath + "/"
-      }
-      relative := strings.TrimPrefix(f.FileName, prefix)
-      relParts := strings.Split(relative, "/")
-      currentPart := relParts[0]
-      // Note: Zoekt won't return a sole directory as a match, only some files
-      // within a directory. This also implies that any directory we encounter
-      // will be non-empty.
-      isFile := len(relParts) == 1
-      if _, exists := seen[currentPart]; !exists {
-        seen[currentPart] = true
-        t := FileTree{
-          KytheUri: f.Repository + ":" + prefix + currentPart,
-          Display: currentPart,
-          OnlyGenerated: false,
-          IsFile: isFile,
-          // Note: as we query all files below 'top' now, we could as well
-          // eagerly build the full subtree. That might be a future option.
-          Children: nil,
-        }
-        subtrees = append(subtrees, t)
-      }
-    }
-    sort.Slice(subtrees, func(i, j int) bool {
-      if subtrees[i].IsFile != subtrees[j].IsFile {
-        return subtrees[j].IsFile
-      }
-      if subtrees[i].Display < subtrees[j].Display {
-        return true
-      }
-      return false
-    })
-  }
+	subtrees := []FileTree{}
+	if topRepo == "" {
+		for r, _ := range result.RepoURLs {
+			t := FileTree{
+				KytheUri:      r,
+				Display:       r,
+				OnlyGenerated: false,
+				IsFile:        false,
+				Children:      nil,
+			}
+			subtrees = append(subtrees, t)
+		}
+	} else {
+		seen := map[string]bool{}
+		for _, f := range result.Files {
+			prefix := ""
+			if topPath != "" {
+				prefix = topPath + "/"
+			}
+			relative := strings.TrimPrefix(f.FileName, prefix)
+			relParts := strings.Split(relative, "/")
+			currentPart := relParts[0]
+			// Note: Zoekt won't return a sole directory as a match, only some files
+			// within a directory. This also implies that any directory we encounter
+			// will be non-empty.
+			isFile := len(relParts) == 1
+			if _, exists := seen[currentPart]; !exists {
+				seen[currentPart] = true
+				t := FileTree{
+					KytheUri:      f.Repository + ":" + prefix + currentPart,
+					Display:       currentPart,
+					OnlyGenerated: false,
+					IsFile:        isFile,
+					// Note: as we query all files below 'top' now, we could as well
+					// eagerly build the full subtree. That might be a future option.
+					Children: nil,
+				}
+				subtrees = append(subtrees, t)
+			}
+		}
+		sort.Slice(subtrees, func(i, j int) bool {
+			if subtrees[i].IsFile != subtrees[j].IsFile {
+				return subtrees[j].IsFile
+			}
+			if subtrees[i].Display < subtrees[j].Display {
+				return true
+			}
+			return false
+		})
+	}
 
-  w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-  w.WriteHeader(http.StatusOK)
-  if err = json.NewEncoder(w).Encode(FileTree{
-    KytheUri: "toplevel",
-    Display: "wontshow",
-    OnlyGenerated: false,
-    IsFile: false,
-    Children: &subtrees,
-  }); err != nil {
-    return err
-  }
-  //fmt.Fprintf(w, "{}", html.EscapeString(r.URL.Path))
-  return nil
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
+	if err = json.NewEncoder(w).Encode(FileTree{
+		KytheUri:      "toplevel",
+		Display:       "wontshow",
+		OnlyGenerated: false,
+		IsFile:        false,
+		Children:      &subtrees,
+	}); err != nil {
+		return err
+	}
+	//fmt.Fprintf(w, "{}", html.EscapeString(r.URL.Path))
+	return nil
 }
 
 func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
 	err := s.serveSearchErr(w, r)
 
-  // Note: zoekt-webserver checks for query suggest here. Should we?
+	// Note: zoekt-webserver checks for query suggest here. Should we?
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusTeapot)
 	}
@@ -216,7 +216,7 @@ func (s *Server) serveSearchErr(w http.ResponseWriter, r *http.Request) error {
 		repoOnly = repoOnly && ok
 	})
 	if repoOnly {
-    return fmt.Errorf("repo-only query not supported")
+		return fmt.Errorf("repo-only query not supported")
 	}
 
 	numStr := qvals.Get("num")
@@ -228,7 +228,7 @@ func (s *Server) serveSearchErr(w http.ResponseWriter, r *http.Request) error {
 
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
-    Whole: true,
+		Whole:       true,
 	}
 
 	sOpts.SetDefaults()
@@ -265,38 +265,37 @@ func (s *Server) serveSearchErr(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-  // TODO
+	// TODO
 	//fileMatches, err := s.formatResults(result, queryStr, s.Print)
 	if err != nil {
 		return err
 	}
 
-  /*
-	res := ResultInput{
-		Last: LastInput{
-			Query:     queryStr,
-			Num:       num,
-			AutoFocus: true,
-		},
-		Stats:         result.Stats,
-		Query:         q.String(),
-		QueryStr:      queryStr,
-		SearchOptions: sOpts.String(),
-		FileMatches:   fileMatches,
-	}
-	if res.Stats.Wait < res.Stats.Duration/10 {
-		// Suppress queueing stats if they are neglible.
-		res.Stats.Wait = 0
-	}
+	/*
+		res := ResultInput{
+			Last: LastInput{
+				Query:     queryStr,
+				Num:       num,
+				AutoFocus: true,
+			},
+			Stats:         result.Stats,
+			Query:         q.String(),
+			QueryStr:      queryStr,
+			SearchOptions: sOpts.String(),
+			FileMatches:   fileMatches,
+		}
+		if res.Stats.Wait < res.Stats.Duration/10 {
+			// Suppress queueing stats if they are neglible.
+			res.Stats.Wait = 0
+		}
 
-	if err := s.result.Execute(&buf, &res); err != nil {
-		return err
-	}
-  */
+		if err := s.result.Execute(&buf, &res); err != nil {
+			return err
+		}
+	*/
 	var buf bytes.Buffer
-  fmt.Printf("%v", result)
+	fmt.Printf("%v", result)
 
 	w.Write(buf.Bytes())
 	return nil
 }
-

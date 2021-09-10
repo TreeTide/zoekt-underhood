@@ -72,12 +72,12 @@ func main() {
 	// Tune GOMAXPROCS to match Linux container CPU quota.
 	maxprocs.Set()
 
-  if *index == "" {
-    log.Fatalf("Please specify index directory with -index")
-  }
-  if fi, err := os.Lstat(*index); err != nil || !fi.IsDir() {
-    log.Fatalf("%s is not a directory (for index)", *index)
-  }
+	if *index == "" {
+		log.Fatalf("Please specify index directory with -index")
+	}
+	if fi, err := os.Lstat(*index); err != nil || !fi.IsDir() {
+		log.Fatalf("%s is not a directory (for index)", *index)
+	}
 
 	searcher, err := shards.NewDirectorySearcher(*index)
 	if err != nil {
@@ -88,7 +88,7 @@ func main() {
 		Searcher: searcher,
 	}
 
-  handler, err := web.NewMux(s)
+	handler, err := web.NewMux(s)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -114,4 +114,3 @@ func main() {
 	}
 	log.Printf("ListenAndServe: %v", err)
 }
-
