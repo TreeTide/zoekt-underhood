@@ -35,6 +35,8 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", s.serveSearch)
 	mux.HandleFunc("/api/filetree", s.serveFileTree)
+	mux.HandleFunc("/api/source", s.serveSource)
+	mux.HandleFunc("/api/decor", s.serveDecors)
 
 	return mux, nil
 }
@@ -64,10 +66,6 @@ func (s *Server) serveFileTree(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-/*
-   Top-level files:  f:^[^/]*$
-   That, together with repo filter, could work...
-*/
 func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error {
 	// Assumption: all paths (in request, in Zoekt response) are normalized.
 	log.Printf("request: %v", r.URL)
@@ -75,6 +73,7 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 	if tops, ok := r.URL.Query()["top"]; ok {
 		top = tops[0]
 	}
+	// TODO: [ticket escaping] would be needed, in case it can contain colon.
 	topParts := strings.SplitN(top, ":", 2)
 	topRepo := ""
 	topPath := ""
@@ -95,7 +94,14 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 
 	rq := "r:"
 	if topRepo != "" {
+		// TODO: [repo filter] in Zoekt is substring-match now, and pinning with
+		//     regexp is not supported. So we must filter for the exact repo when
+		//     iterating the results later.
+		//
+		//     But this would be better to support explicitly in Zoekt search API.
+		//
 		rq += topRepo
+
 		if topPath == "" {
 			// Well, zoekt obviously doesn't return dir matches. So something like
 			//
@@ -138,6 +144,10 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 	} else {
 		seen := map[string]bool{}
 		for _, f := range result.Files {
+			if f.Repository != topRepo {
+				// See [repo filter]
+				continue
+			}
 			prefix := ""
 			if topPath != "" {
 				prefix = topPath + "/"
@@ -167,10 +177,7 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 			if subtrees[i].IsFile != subtrees[j].IsFile {
 				return subtrees[j].IsFile
 			}
-			if subtrees[i].Display < subtrees[j].Display {
-				return true
-			}
-			return false
+			return subtrees[i].Display < subtrees[j].Display
 		})
 	}
 
@@ -187,6 +194,79 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 	}
 	//fmt.Fprintf(w, "{}", html.EscapeString(r.URL.Path))
 	return nil
+}
+
+func (s *Server) serveSource(w http.ResponseWriter, r *http.Request) {
+	if err := s.serveSourceErr(w, r); err != nil {
+		http.Error(w, err.Error(), http.StatusTeapot)
+	}
+}
+
+func (s *Server) serveSourceErr(w http.ResponseWriter, r *http.Request) error {
+	log.Printf("request: %v", r.URL)
+	tickets, ok := r.URL.Query()["ticket"]
+	if !ok || len(tickets) > 1 {
+		return fmt.Errorf("expected ticket parameter")
+	}
+	ticket := tickets[0]
+	// See [ticket escaping]
+	parts := strings.SplitN(ticket, ":", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("Expected ticket in repo:path format")
+	}
+	repo := parts[0]
+	path := parts[1]
+
+	sOpts := zoekt.SearchOptions{
+		MaxWallTime: 10 * time.Second,
+	}
+	sOpts.SetDefaults()
+	// TODO estimate matches and set max counts to enable result to be included.
+	//   Normally there would be exactly 1 hit, but see [repo filter] comment.
+	sOpts.Whole = true
+
+	ctx := r.Context()
+
+	// Note the [repo filter].
+	rq := "r:" + repo + " f:^" + path + "$"
+	log.Printf("query: %v", rq)
+
+	q, err := query.Parse(rq)
+	if err != nil {
+		return err
+	}
+
+	result, err := s.Searcher.Search(ctx, q, &sOpts)
+	if err != nil {
+		return err
+	}
+
+	for _, f := range result.Files {
+		if f.Repository != repo {
+			// See [repo filter].
+			continue
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write(f.Content)
+		return nil
+	}
+	return fmt.Errorf("Requested file not in response. Query: %v", rq)
+}
+
+// Serving decors is not supported, would need pre-calculated references.
+func (s *Server) serveDecors(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
+	// Just return an empty list of decors. string type arbitrarily chosen,
+	// doesn't matter.
+	if err := json.NewEncoder(w).Encode(struct {
+		Decors []string `json:"decors"`
+	}{
+		Decors: []string{},
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusTeapot)
+	}
 }
 
 func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
