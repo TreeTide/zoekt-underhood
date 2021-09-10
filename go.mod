@@ -1,4 +1,4 @@
-module github.com/robinp/zoekt-underhood
+module github.com/TreeTide/zoekt-underhood
 
 go 1.13
 
