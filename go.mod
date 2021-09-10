@@ -1,4 +1,4 @@
-module github.com/google/zoekt
+module github.com/robinp/zoekt-underhood
 
 go 1.13
 
@@ -12,6 +12,7 @@ require (
 	github.com/google/go-cmp v0.5.5
 	github.com/google/go-github/v27 v27.0.6
 	github.com/google/slothfs v0.0.0-20190417171004-6b42407d9230
+	github.com/google/zoekt v0.0.0-20210819084712-fcc0c9ab67c5 // indirect
 	github.com/kylelemons/godebug v1.1.0
 	github.com/mitchellh/mapstructure v1.1.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

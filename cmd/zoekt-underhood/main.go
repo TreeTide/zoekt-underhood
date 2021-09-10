@@ -1,34 +1,21 @@
-// Copyright 2016 Google Inc. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
-	"context"
+	//"context"
 	"flag"
 	"fmt"
-	"html/template"
-	"io/ioutil"
+	//"html/template"
+	//"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"path/filepath"
-	"strings"
+	//"strings"
 	"time"
 
-	"github.com/google/zoekt"
+	"github.com/robinp/zoekt-underhood/web"
+	//"github.com/google/zoekt"
 	//"github.com/google/zoekt/build"
 	"github.com/google/zoekt/shards"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -66,7 +53,7 @@ func main() {
 	logRefresh := flag.Duration("log_refresh", 24*time.Hour, "if using --log_dir, start writing a new file this often.")
 
 	listen := flag.String("listen", ":6080", "listen on this address.")
-	index := flag.String("index", build.DefaultDir, "set index directory to use")
+	index := flag.String("index", "", "set index directory to use")
 	enablePprof := flag.Bool("pprof", false, "set to enable remote profiling.")
 	sslCert := flag.String("ssl_cert", "", "set path to SSL .pem holding certificate.")
 	sslKey := flag.String("ssl_key", "", "set path to SSL .pem holding key.")
@@ -85,9 +72,12 @@ func main() {
 	// Tune GOMAXPROCS to match Linux container CPU quota.
 	maxprocs.Set()
 
-	if err := os.MkdirAll(*index, 0o755); err != nil {
-		log.Fatal(err)
-	}
+  if *index == "" {
+    log.Fatalf("Please specify index directory with -index")
+  }
+  if fi, err := os.Lstat(*index); err != nil || !fi.IsDir() {
+    log.Fatalf("%s is not a directory (for index)", *index)
+  }
 
 	searcher, err := shards.NewDirectorySearcher(*index)
 	if err != nil {
