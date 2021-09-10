@@ -1,14 +1,12 @@
 package web
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	//"html"
 	"log"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +16,12 @@ import (
 	"github.com/google/zoekt/query"
 )
 
-const defaultNumResults = 50
+// Notes:
+//
+// When doing Zoekt queries, hit numbers are not estimated. This could lead to
+// missing some results (though the default limits are pretty high).
+//
+// Some remarks about UTF-8 support in the code.
 
 type Server struct {
 	Searcher zoekt.Searcher
@@ -33,10 +36,10 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 	s.startTime = time.Now()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/search", s.serveSearch)
 	mux.HandleFunc("/api/filetree", s.serveFileTree)
 	mux.HandleFunc("/api/source", s.serveSource)
 	mux.HandleFunc("/api/decor", s.serveDecors)
+	mux.HandleFunc("/api/search-xref", s.serveSearchXref)
 
 	return mux, nil
 }
@@ -269,113 +272,153 @@ func (s *Server) serveDecors(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
-	err := s.serveSearchErr(w, r)
+// Mirrors Underhood's XRefReply.
+type UhXRefReply struct {
+	Refs     []UhSite `json:"refs"`
+	RefCount int      `json:"refCount"`
+	// Below unused by zoekt-underhood, populated to default values.
+	Calls        []string `json:"calls"`
+	CallCount    int      `json:"callCount"`
+	Definitions  []string `json:"definitions"`
+	Declarations []string `json:"declarations"`
+}
 
-	// Note: zoekt-webserver checks for query suggest here. Should we?
-	if err != nil {
+type UhSite struct {
+	ContainingFile UhDisplayedFile `json:"sContainingFile"`
+	Snippet        UhSnippet       `json:"sSnippet"`
+}
+
+type UhDisplayedFile struct {
+	FileTicket  string `json:"dfFileTicket"`
+	DisplayName string `json:"dfDisplayName"`
+}
+
+type UhSnippet struct {
+	Text           string  `json:"snippetText"`
+	FullSpan       CmRange `json:"snippetFullSpan"`
+	OccurrenceSpan CmRange `json:"snippetOccurrenceSpan"`
+}
+
+type CmRange struct {
+	From CmPoint `json:"from"`
+	To   CmPoint `json:"to"`
+}
+
+type CmPoint struct {
+	Line int `json:"line"`
+	Ch   int `json:"ch"`
+}
+
+func (s *Server) serveSearchXref(w http.ResponseWriter, r *http.Request) {
+	if err := s.serveSearchXrefErr(w, r); err != nil {
 		http.Error(w, err.Error(), http.StatusTeapot)
 	}
 }
 
-func (s *Server) serveSearchErr(w http.ResponseWriter, r *http.Request) error {
-	qvals := r.URL.Query()
-	queryStr := qvals.Get("q")
-	if queryStr == "" {
-		return fmt.Errorf("no query found")
+func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) error {
+	// Notes: Sources are assumed to be UTF-8 (that's what the UI expects).
+	// If that wouldn't stand, either repos would need to be converted to UTF-8
+	// before indexing, or we could attempt on-the-fly conversion here based on
+	// heuristics.
+	//
+	// That said, since Zoekt API returns positions in bytes, but Underhood (and
+	// CodeMirror that it uses) expects them in characters (codepoints?),
+	// conversion between the two would be needed. Thankfully we would only need
+	// to convert within the line, as line numbers are not affected. That could
+	// be done, but in the mean time, correct line fragment spans are only
+	// returned for plain-text code.
+	log.Printf("request: %v", r.URL)
+	selections, ok := r.URL.Query()["selection"]
+	if !ok || len(selections) > 1 {
+		return fmt.Errorf("expected selection parameter")
 	}
-
-	q, err := query.Parse(queryStr)
-	if err != nil {
-		return err
-	}
-
-	repoOnly := true
-	query.VisitAtoms(q, func(q query.Q) {
-		_, ok := q.(*query.Repo)
-		repoOnly = repoOnly && ok
-	})
-	if repoOnly {
-		return fmt.Errorf("repo-only query not supported")
-	}
-
-	numStr := qvals.Get("num")
-
-	num, err := strconv.Atoi(numStr)
-	if err != nil || num <= 0 {
-		num = defaultNumResults
-	}
+	selection := selections[0]
 
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
-		Whole:       true,
 	}
-
 	sOpts.SetDefaults()
+	// TODO estimate matches...
 
 	ctx := r.Context()
-	if result, err := s.Searcher.Search(ctx, q, &zoekt.SearchOptions{EstimateDocCount: true}); err != nil {
+
+	// TODO we should further massage the selection - like escape quotes.
+	// Also, if we had more context in the query (repo, path), we could make
+	// multiple Zoekt queries with different filters, to return more contextual
+	// results with priority.
+	//
+	// In case no / few results are found, we could relax the filter, to be case
+	// insensitive for example.
+	//
+	// Support for custom, pattern-based transformations and rules could be
+	// added.
+	rq := "\"" + selection + "\""
+	log.Printf("query: %v", rq)
+
+	q, err := query.Parse(rq)
+	if err != nil {
 		return err
-	} else if numdocs := result.ShardFilesConsidered; numdocs > 10000 {
-		// If the search touches many shards and many files, we
-		// have to limit the number of matches.  This setting
-		// is based on the number of documents eligible after
-		// considering reponames, so large repos (both
-		// android, chromium are about 500k files) aren't
-		// covered fairly.
-
-		// 10k docs, 50 num -> max match = (250 + 250 / 10)
-		sOpts.ShardMaxMatchCount = num*5 + (5*num)/(numdocs/1000)
-
-		// 10k docs, 50 num -> max important match = 4
-		sOpts.ShardMaxImportantMatch = num/20 + num/(numdocs/500)
-	} else {
-		// Virtually no limits for a small corpus; important
-		// matches are just as expensive as normal matches.
-		n := numdocs + num*100
-		sOpts.ShardMaxImportantMatch = n
-		sOpts.ShardMaxMatchCount = n
-		sOpts.TotalMaxMatchCount = n
-		sOpts.TotalMaxImportantMatch = n
 	}
-	sOpts.MaxDocDisplayCount = num
 
 	result, err := s.Searcher.Search(ctx, q, &sOpts)
 	if err != nil {
 		return err
 	}
 
-	// TODO
-	//fileMatches, err := s.formatResults(result, queryStr, s.Print)
-	if err != nil {
-		return err
+	refs := []UhSite{}
+	for _, f := range result.Files {
+		// f.Repository, f.FileName
+		ticket := f.Repository + ":" + f.FileName
+		inFile := UhDisplayedFile{
+			FileTicket:  ticket,
+			DisplayName: ticket,
+		}
+		for _, l := range f.LineMatches {
+			// For now we only return first fragment match in line for bolding.
+			firstFrag := l.LineFragments[0]
+			lineNum := l.LineNumber - 1
+			snippet := UhSnippet{
+				Text: string(l.Line), // TODO handle if non-UTF8 etc?
+				// Inventing one based on approximation.
+				FullSpan: CmRange{
+					From: CmPoint{
+						Line: lineNum,
+						Ch:   0,
+					},
+					To: CmPoint{
+						Line: lineNum,
+						// TODO: Zoekt supplies range in bytes, while we need chars.
+						//       Would need to convert based on observing line content.
+						Ch: l.LineEnd - l.LineStart,
+					},
+				},
+				OccurrenceSpan: CmRange{
+					From: CmPoint{
+						Line: lineNum,
+						Ch:   firstFrag.LineOffset, // TODO convert from bytes to chars
+					},
+					To: CmPoint{
+						Line: lineNum,
+						Ch:   firstFrag.LineOffset + firstFrag.MatchLength, // TODO convert
+					},
+				},
+			}
+			refs = append(refs, UhSite{
+				ContainingFile: inFile,
+				Snippet:        snippet,
+			})
+		}
 	}
 
-	/*
-		res := ResultInput{
-			Last: LastInput{
-				Query:     queryStr,
-				Num:       num,
-				AutoFocus: true,
-			},
-			Stats:         result.Stats,
-			Query:         q.String(),
-			QueryStr:      queryStr,
-			SearchOptions: sOpts.String(),
-			FileMatches:   fileMatches,
-		}
-		if res.Stats.Wait < res.Stats.Duration/10 {
-			// Suppress queueing stats if they are neglible.
-			res.Stats.Wait = 0
-		}
-
-		if err := s.result.Execute(&buf, &res); err != nil {
-			return err
-		}
-	*/
-	var buf bytes.Buffer
-	fmt.Printf("%v", result)
-
-	w.Write(buf.Bytes())
+	if err = json.NewEncoder(w).Encode(UhXRefReply{
+		Refs:         refs,
+		RefCount:     len(refs),
+		Calls:        []string{},
+		CallCount:    0,
+		Definitions:  []string{},
+		Declarations: []string{},
+	}); err != nil {
+		return err
+	}
 	return nil
 }
