@@ -176,13 +176,13 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 				subtrees = append(subtrees, t)
 			}
 		}
-		sort.Slice(subtrees, func(i, j int) bool {
-			if subtrees[i].IsFile != subtrees[j].IsFile {
-				return subtrees[j].IsFile
-			}
-			return subtrees[i].Display < subtrees[j].Display
-		})
 	}
+	sort.Slice(subtrees, func(i, j int) bool {
+		if subtrees[i].IsFile != subtrees[j].IsFile {
+			return subtrees[j].IsFile
+		}
+		return subtrees[i].Display < subtrees[j].Display
+	})
 
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	w.WriteHeader(http.StatusOK)
