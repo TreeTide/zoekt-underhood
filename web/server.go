@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	//"golang.org/x/net/context"
+	"golang.org/x/net/context"
 
 	"github.com/google/zoekt"
 	"github.com/google/zoekt/query"
@@ -76,16 +76,12 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 	if tops, ok := r.URL.Query()["top"]; ok {
 		top = tops[0]
 	}
-	// TODO: [ticket escaping] would be needed, in case it can contain colon.
-	topParts := strings.SplitN(top, ":", 2)
-	topRepo := ""
-	topPath := ""
-	if len(topParts) > 0 {
-		topRepo = topParts[0]
+	ticket, err := parseTicket(top)
+	if err != nil {
+		return err
 	}
-	if len(topParts) > 1 {
-		topPath = topParts[1]
-	}
+	topRepo := ticket.repo
+	topPath := ticket.path
 
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
@@ -234,13 +230,15 @@ func (s *Server) serveSourceErr(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("expected ticket parameter")
 	}
 	ticket := tickets[0]
-	// See [ticket escaping]
-	parts := strings.SplitN(ticket, ":", 2)
-	if len(parts) != 2 {
+	tick, err := parseTicket(ticket)
+	if err != nil {
+		return err
+	}
+	if !tick.complete() {
 		return fmt.Errorf("Expected ticket in repo:path format")
 	}
-	repo := parts[0]
-	path := parts[1]
+	repo := tick.repo
+	path := tick.path
 
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
@@ -356,25 +354,79 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	}
 	selection := selections[0]
 
+	tickets, ok := r.URL.Query()["ticket"]
+	if !ok {
+		// Make up a dummy ticket, in case one was not supplied.
+		tickets = []string{"nosuchrepo:nosuchfile"}
+	}
+	if len(tickets) > 1 {
+		return fmt.Errorf("expected single ticket parameter")
+	}
+	ticket := tickets[0]
+	queryTicket, err := parseTicket(ticket)
+	if err != nil {
+		return err
+	}
+
+	ctx := r.Context()
+
+	refs := []UhSite{}
+
+	rq := "\"" + selection + "\""
+	if err := s.appendSearches(rq, ctx, &refs); err != nil {
+		return err
+	}
+	// Note: if the [repo filter] was more precise, we could shoot multiple
+	// well-crafted queries and just concat them. But for now resort to sorting.
+	sort.SliceStable(refs, func(i, j int) bool {
+		ti, err := parseTicket(refs[i].ContainingFile.FileTicket)
+		if err != nil {
+			return false
+		}
+		tj, err := parseTicket(refs[j].ContainingFile.FileTicket)
+		if err != nil {
+			return false
+		}
+		if ti.repo != tj.repo {
+			if ti.repo == queryTicket.repo {
+				return true
+			}
+			if tj.repo == queryTicket.repo {
+				return false
+			}
+		}
+		// Same repo from now on.
+		if ti.repo == queryTicket.repo && ti.path != tj.path {
+			if ti.path == queryTicket.path {
+				return true
+			}
+			if tj.path == queryTicket.path {
+				return false
+			}
+		}
+		return false // Keep original order
+	})
+
+	if err := json.NewEncoder(w).Encode(UhXRefReply{
+		Refs:         refs,
+		RefCount:     len(refs),
+		Calls:        []string{},
+		CallCount:    0,
+		Definitions:  []string{},
+		Declarations: []string{},
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) appendSearches(rq string, ctx context.Context, refs *[]UhSite) error {
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
 	}
 	sOpts.SetDefaults()
 	// TODO estimate matches...
 
-	ctx := r.Context()
-
-	// TODO we should further massage the selection - like escape quotes.
-	// Also, if we had more context in the query (repo, path), we could make
-	// multiple Zoekt queries with different filters, to return more contextual
-	// results with priority.
-	//
-	// In case no / few results are found, we could relax the filter, to be case
-	// insensitive for example.
-	//
-	// Support for custom, pattern-based transformations and rules could be
-	// added.
-	rq := "\"" + selection + "\""
 	log.Printf("query: %v", rq)
 
 	q, err := query.Parse(rq)
@@ -387,7 +439,6 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 
-	refs := []UhSite{}
 	for _, f := range result.Files {
 		// f.Repository, f.FileName
 		ticket := f.Repository + ":" + f.FileName
@@ -425,22 +476,34 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 					},
 				},
 			}
-			refs = append(refs, UhSite{
+			*refs = append(*refs, UhSite{
 				ContainingFile: inFile,
 				Snippet:        snippet,
 			})
 		}
 	}
-
-	if err = json.NewEncoder(w).Encode(UhXRefReply{
-		Refs:         refs,
-		RefCount:     len(refs),
-		Calls:        []string{},
-		CallCount:    0,
-		Definitions:  []string{},
-		Declarations: []string{},
-	}); err != nil {
-		return err
-	}
 	return nil
+}
+
+type ticket struct {
+	// Any param is empty if not present in ticket.
+	repo string
+	path string
+}
+
+func parseTicket(t string) (ticket, error) {
+	// TODO: [ticket escaping] would be needed, in case it can contain colon.
+	parts := strings.SplitN(t, ":", 2)
+	res := ticket{}
+	if len(parts) > 0 {
+		res.repo = parts[0]
+	}
+	if len(parts) > 1 {
+		res.path = parts[1]
+	}
+	return res, nil
+}
+
+func (t *ticket) complete() bool {
+	return t.repo != "" && t.path != ""
 }
