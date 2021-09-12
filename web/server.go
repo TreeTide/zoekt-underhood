@@ -127,24 +127,46 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
-	result, err := s.Searcher.Search(ctx, q, &sOpts)
-	if err != nil {
-		return err
-	}
-
 	subtrees := []FileTree{}
 	if topRepo == "" {
-		for r, _ := range result.RepoURLs {
-			t := FileTree{
-				KytheUri:      r,
-				Display:       r,
-				OnlyGenerated: false,
-				IsFile:        false,
-				Children:      nil,
+		result, err := s.Searcher.List(ctx, q)
+		if err != nil {
+			return err
+		}
+
+		for _, re := range result.Repos {
+			r := re.Repository
+			if len(r.Branches) == 0 {
+				// A non-git-like repo. For example plain dir.
+				t := FileTree{
+					KytheUri:      r.Name,
+					Display:       r.Name,
+					OnlyGenerated: false,
+					IsFile:        false,
+					Children:      nil,
+				}
+				subtrees = append(subtrees, t)
+
+			} else {
+				for _, b := range r.Branches {
+					ticketId := r.Name + "@" + b.Name
+					t := FileTree{
+						KytheUri:      ticketId,
+						Display:       ticketId,
+						OnlyGenerated: false,
+						IsFile:        false,
+						Children:      nil,
+					}
+					subtrees = append(subtrees, t)
+				}
 			}
-			subtrees = append(subtrees, t)
 		}
 	} else {
+		result, err := s.Searcher.Search(ctx, q, &sOpts)
+		if err != nil {
+			return err
+		}
+
 		seen := map[string]bool{}
 		for _, f := range result.Files {
 			if f.Repository != topRepo {
