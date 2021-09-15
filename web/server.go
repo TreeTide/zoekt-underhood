@@ -382,6 +382,15 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	}
 	selection := selections[0]
 
+	casings, ok := r.URL.Query()["casing"]
+	casing := "auto"
+	if ok {
+		c := casings[0]
+		if c == "yes" || c == "no" || c == "auto" {
+			casing = c
+		}
+	}
+
 	tickets, ok := r.URL.Query()["ticket"]
 	if !ok {
 		// Make up a dummy ticket, in case one was not supplied.
@@ -401,7 +410,7 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	fileSites := []fileSites{}
 
 	// See https://github.com/google/zoekt/issues/139 for not wrapping in quotes
-	rq := escapeLiteralQuery(selection)
+	rq := "case:" + casing + " " + escapeLiteralQuery(selection)
 	if err := s.appendSearches(rq, ctx, &fileSites); err != nil {
 		return err
 	}
@@ -500,18 +509,46 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 }
 
 func (s *Server) appendSearches(rq string, ctx context.Context, manyFileSites *[]fileSites) error {
-	sOpts := zoekt.SearchOptions{
-		MaxWallTime: 10 * time.Second,
-	}
-	sOpts.SetDefaults()
-	// TODO estimate matches...
-
 	log.Printf("query: %v", rq)
-
 	q, err := query.Parse(rq)
 	if err != nil {
 		return err
 	}
+
+	sOpts := zoekt.SearchOptions{
+		MaxWallTime: 10 * time.Second,
+	}
+	sOpts.SetDefaults()
+
+	// Number of files to return - fixed for now.
+	num := 500
+
+	// BEGIN cargo-cult limiting from zoekt:web/server.go
+	if result, err := s.Searcher.Search(ctx, q, &zoekt.SearchOptions{EstimateDocCount: true}); err != nil {
+		return err
+	} else if numdocs := result.ShardFilesConsidered; numdocs > 10000 {
+		// If the search touches many shards and many files, we
+		// have to limit the number of matches.  This setting
+		// is based on the number of documents eligible after
+		// considering reponames, so large repos (both
+		// android, chromium are about 500k files) aren't
+		// covered fairly.
+
+		// 10k docs, 50 num -> max match = (250 + 250 / 10)
+		sOpts.ShardMaxMatchCount = num*5 + (5*num)/(numdocs/1000)
+
+		// 10k docs, 50 num -> max important match = 4
+		sOpts.ShardMaxImportantMatch = num/20 + num/(numdocs/500)
+	} else {
+		// Virtually no limits for a small corpus; important
+		// matches are just as expensive as normal matches.
+		n := numdocs + num*100
+		sOpts.ShardMaxImportantMatch = n
+		sOpts.ShardMaxMatchCount = n
+		sOpts.TotalMaxMatchCount = n
+		sOpts.TotalMaxImportantMatch = n
+	}
+	sOpts.MaxDocDisplayCount = num
 
 	result, err := s.Searcher.Search(ctx, q, &sOpts)
 	if err != nil {
@@ -595,7 +632,7 @@ func (t *ticket) complete() bool {
 }
 
 func escapeLiteralQuery(s string) string {
-	toEscape := "()[]\\.*?^$+{}, "
+	toEscape := ":()[]\\.*?^$+{}, "
 	var r strings.Builder
 	for _, c := range s {
 		if strings.ContainsAny(string(c), toEscape) {
