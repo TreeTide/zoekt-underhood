@@ -294,8 +294,8 @@ func (s *Server) serveDecors(w http.ResponseWriter, r *http.Request) {
 
 // Mirrors Underhood's XRefReply.
 type UhXRefReply struct {
-	Refs     []UhSite `json:"refs"`
-	RefCount int      `json:"refCount"`
+	Refs     []UhSiteGroup `json:"refs"`
+	RefCount int           `json:"refCount"`
 	// Below unused by zoekt-underhood, populated to default values.
 	Calls        []string `json:"calls"`
 	CallCount    int      `json:"callCount"`
@@ -303,9 +303,14 @@ type UhXRefReply struct {
 	Declarations []string `json:"declarations"`
 }
 
-type UhSite struct {
-	ContainingFile UhDisplayedFile `json:"sContainingFile"`
-	Snippet        UhSnippet       `json:"sSnippet"`
+type UhSiteGroup struct {
+	Files []UhFileSites `json:"sFileSites"`
+}
+
+type UhFileSites struct {
+	ContainingFile UhDisplayedFile  `json:"sContainingFile"`
+	IsDupOf        *UhDisplayedFile `json:"sDupOfFile"`
+	Snippets       []UhSnippet      `json:"sSnippets"`
 }
 
 type UhDisplayedFile struct {
@@ -370,20 +375,22 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 
 	ctx := r.Context()
 
-	refs := []UhSite{}
+	fileSites := []UhFileSites{}
 
+	// hash to ticket
+	seenTickets := map[string]*UhDisplayedFile{}
 	rq := "\"" + selection + "\""
-	if err := s.appendSearches(rq, ctx, &refs); err != nil {
+	if err := s.appendSearches(rq, ctx, seenTickets, &fileSites); err != nil {
 		return err
 	}
 	// Note: if the [repo filter] was more precise, we could shoot multiple
 	// well-crafted queries and just concat them. But for now resort to sorting.
-	sort.SliceStable(refs, func(i, j int) bool {
-		ti, err := parseTicket(refs[i].ContainingFile.FileTicket)
+	sort.SliceStable(fileSites, func(i, j int) bool {
+		ti, err := parseTicket(fileSites[i].ContainingFile.FileTicket)
 		if err != nil {
 			return false
 		}
-		tj, err := parseTicket(refs[j].ContainingFile.FileTicket)
+		tj, err := parseTicket(fileSites[j].ContainingFile.FileTicket)
 		if err != nil {
 			return false
 		}
@@ -407,9 +414,13 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 		return false // Keep original order
 	})
 
+	g := UhSiteGroup{
+		Files: fileSites,
+	}
+
 	if err := json.NewEncoder(w).Encode(UhXRefReply{
-		Refs:         refs,
-		RefCount:     len(refs),
+		Refs:         []UhSiteGroup{g},
+		RefCount:     100, // TODO len(refs),
 		Calls:        []string{},
 		CallCount:    0,
 		Definitions:  []string{},
@@ -420,7 +431,7 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	return nil
 }
 
-func (s *Server) appendSearches(rq string, ctx context.Context, refs *[]UhSite) error {
+func (s *Server) appendSearches(rq string, ctx context.Context, seenTickets map[string]*UhDisplayedFile, fileSites *[]UhFileSites) error {
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
 	}
@@ -440,12 +451,18 @@ func (s *Server) appendSearches(rq string, ctx context.Context, refs *[]UhSite) 
 	}
 
 	for _, f := range result.Files {
-		// f.Repository, f.FileName
 		ticket := f.Repository + ":" + f.FileName
 		inFile := UhDisplayedFile{
 			FileTicket:  ticket,
 			DisplayName: ticket,
 		}
+		var dupTick *UhDisplayedFile = nil
+		if seenTick, ok := seenTickets[string(f.Checksum)]; ok {
+			dupTick = seenTick
+		} else {
+			seenTickets[string(f.Checksum)] = &inFile
+		}
+		snippets := []UhSnippet{}
 		for _, l := range f.LineMatches {
 			// For now we only return first fragment match in line for bolding.
 			firstFrag := l.LineFragments[0]
@@ -476,11 +493,13 @@ func (s *Server) appendSearches(rq string, ctx context.Context, refs *[]UhSite) 
 					},
 				},
 			}
-			*refs = append(*refs, UhSite{
-				ContainingFile: inFile,
-				Snippet:        snippet,
-			})
+			snippets = append(snippets, snippet)
 		}
+		*fileSites = append(*fileSites, UhFileSites{
+			ContainingFile: inFile,
+			IsDupOf:        dupTick,
+			Snippets:       snippets,
+		})
 	}
 	return nil
 }
@@ -493,6 +512,8 @@ type ticket struct {
 
 func parseTicket(t string) (ticket, error) {
 	// TODO: [ticket escaping] would be needed, in case it can contain colon.
+	//   But, it seems Zoekt doesn't escape either internally (see ResultID), so
+	//   maby we can live with assuming colon won't be part of filenames.
 	parts := strings.SplitN(t, ":", 2)
 	res := ticket{}
 	if len(parts) > 0 {
