@@ -391,6 +391,15 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 		}
 	}
 
+	modes, ok := r.URL.Query()["mode"]
+	mode := "Lax"
+	if ok {
+		m := modes[0]
+		if m == "Lax" || m == "Boundary" {
+			mode = m
+		}
+	}
+
 	tickets, ok := r.URL.Query()["ticket"]
 	if !ok {
 		// Make up a dummy ticket, in case one was not supplied.
@@ -410,7 +419,12 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	fileSites := []fileSites{}
 
 	// See https://github.com/google/zoekt/issues/139 for not wrapping in quotes
-	rq := "case:" + casing + " " + escapeLiteralQuery(selection)
+	moddedSelection := escapeLiteralQuery(selection)
+	if mode == "Boundary" {
+		moddedSelection = "\\b" + moddedSelection + "\\b"
+	}
+	rq := "case:" + casing + " " + moddedSelection
+
 	if err := s.appendSearches(rq, ctx, &fileSites); err != nil {
 		return err
 	}
