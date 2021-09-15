@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	//"html"
@@ -292,10 +293,11 @@ func (s *Server) serveDecors(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Mirrors Underhood's XRefReply.
+// Mirrors Underhood's XRefReply (though the two converged away from original
+// Kythe-only).
 type UhXRefReply struct {
-	Refs     []UhSiteGroup `json:"refs"`
-	RefCount int           `json:"refCount"`
+	Refs      []UhSiteGroup `json:"refs"`
+	RefCounts UhRefCounts   `json:"refCounts"`
 	// Below unused by zoekt-underhood, populated to default values.
 	Calls        []string `json:"calls"`
 	CallCount    int      `json:"callCount"`
@@ -303,8 +305,29 @@ type UhXRefReply struct {
 	Declarations []string `json:"declarations"`
 }
 
+type UhRefCounts struct {
+	Lines int `json:"rcLines"`
+	Files int `json:"rcFiles"`
+	// Exact file content match.
+	DupFiles int `json:"rcDupFiles"`
+	// The lines found in a given file are the same (other lines can differ).
+	// Greater than or equal to DupFiles.
+	DupMatches int `json:"rcDupMatches"`
+}
+
 type UhSiteGroup struct {
 	Files []UhFileSites `json:"sFileSites"`
+}
+
+// fileSites is the internal version of UhFileSites, before some postprocessing
+// steps could have happened.
+type fileSites struct {
+	containingFile UhDisplayedFile
+	snippets       []UhSnippet
+	// For deduping on file content.
+	fileChecksum []byte
+	// Hash of line content of snippets, for grouping.
+	snippetsHash []byte
 }
 
 type UhFileSites struct {
@@ -375,22 +398,21 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 
 	ctx := r.Context()
 
-	fileSites := []UhFileSites{}
+	fileSites := []fileSites{}
 
-	// hash to ticket
-	seenTickets := map[string]*UhDisplayedFile{}
-	rq := "\"" + selection + "\""
-	if err := s.appendSearches(rq, ctx, seenTickets, &fileSites); err != nil {
+	// See https://github.com/google/zoekt/issues/139 for not wrapping in quotes
+	rq := escapeLiteralQuery(selection)
+	if err := s.appendSearches(rq, ctx, &fileSites); err != nil {
 		return err
 	}
 	// Note: if the [repo filter] was more precise, we could shoot multiple
 	// well-crafted queries and just concat them. But for now resort to sorting.
 	sort.SliceStable(fileSites, func(i, j int) bool {
-		ti, err := parseTicket(fileSites[i].ContainingFile.FileTicket)
+		ti, err := parseTicket(fileSites[i].containingFile.FileTicket)
 		if err != nil {
 			return false
 		}
-		tj, err := parseTicket(fileSites[j].ContainingFile.FileTicket)
+		tj, err := parseTicket(fileSites[j].containingFile.FileTicket)
 		if err != nil {
 			return false
 		}
@@ -414,13 +436,59 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 		return false // Keep original order
 	})
 
-	g := UhSiteGroup{
-		Files: fileSites,
+	// keyed by file content hash (fileChecksum)
+	seenTickets := map[string]UhDisplayedFile{}
+
+	// keyed by match content hash (snippetsHash)
+	contentGroups := map[string][]UhFileSites{}
+	contentGroupOrder := []string{}
+
+	snipCnt := 0
+	fileCnt := 0
+	fileDupCnt := 0
+	matchDupCnt := 0
+	for _, fs := range fileSites {
+		// Dedup
+		var dupTick *UhDisplayedFile = nil
+		if seenTick, ok := seenTickets[string(fs.fileChecksum)]; ok {
+			dupTick = &seenTick
+			fileDupCnt += 1
+		} else {
+			seenTickets[string(fs.fileChecksum)] = fs.containingFile
+		}
+		// To content group
+		h := string(fs.snippetsHash)
+		s := UhFileSites{
+			ContainingFile: fs.containingFile,
+			IsDupOf:        dupTick,
+			Snippets:       fs.snippets,
+		}
+		if _, ok := contentGroups[h]; ok {
+			contentGroups[h] = append(contentGroups[h], s)
+			matchDupCnt += 1
+		} else {
+			contentGroups[h] = []UhFileSites{s}
+			contentGroupOrder = append(contentGroupOrder, h)
+		}
+		fileCnt += 1
+		snipCnt += len(fs.snippets)
+	}
+
+	gs := []UhSiteGroup{}
+	for _, h := range contentGroupOrder {
+		gs = append(gs, UhSiteGroup{
+			Files: contentGroups[h],
+		})
 	}
 
 	if err := json.NewEncoder(w).Encode(UhXRefReply{
-		Refs:         []UhSiteGroup{g},
-		RefCount:     100, // TODO len(refs),
+		Refs: gs,
+		RefCounts: UhRefCounts{
+			Lines:      snipCnt,
+			Files:      fileCnt,
+			DupFiles:   fileDupCnt,
+			DupMatches: matchDupCnt,
+		},
 		Calls:        []string{},
 		CallCount:    0,
 		Definitions:  []string{},
@@ -431,7 +499,7 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	return nil
 }
 
-func (s *Server) appendSearches(rq string, ctx context.Context, seenTickets map[string]*UhDisplayedFile, fileSites *[]UhFileSites) error {
+func (s *Server) appendSearches(rq string, ctx context.Context, manyFileSites *[]fileSites) error {
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
 	}
@@ -456,17 +524,13 @@ func (s *Server) appendSearches(rq string, ctx context.Context, seenTickets map[
 			FileTicket:  ticket,
 			DisplayName: ticket,
 		}
-		var dupTick *UhDisplayedFile = nil
-		if seenTick, ok := seenTickets[string(f.Checksum)]; ok {
-			dupTick = seenTick
-		} else {
-			seenTickets[string(f.Checksum)] = &inFile
-		}
 		snippets := []UhSnippet{}
+		snippetsHash := sha1.New()
 		for _, l := range f.LineMatches {
 			// For now we only return first fragment match in line for bolding.
 			firstFrag := l.LineFragments[0]
 			lineNum := l.LineNumber - 1
+			snippetsHash.Write(l.Line)
 			snippet := UhSnippet{
 				Text: string(l.Line), // TODO handle if non-UTF8 etc?
 				// Inventing one based on approximation.
@@ -495,10 +559,11 @@ func (s *Server) appendSearches(rq string, ctx context.Context, seenTickets map[
 			}
 			snippets = append(snippets, snippet)
 		}
-		*fileSites = append(*fileSites, UhFileSites{
-			ContainingFile: inFile,
-			IsDupOf:        dupTick,
-			Snippets:       snippets,
+		*manyFileSites = append(*manyFileSites, fileSites{
+			containingFile: inFile,
+			snippets:       snippets,
+			fileChecksum:   f.Checksum,
+			snippetsHash:   snippetsHash.Sum(nil),
 		})
 	}
 	return nil
@@ -527,4 +592,16 @@ func parseTicket(t string) (ticket, error) {
 
 func (t *ticket) complete() bool {
 	return t.repo != "" && t.path != ""
+}
+
+func escapeLiteralQuery(s string) string {
+	toEscape := "()[]\\.*?^$+{}, "
+	var r strings.Builder
+	for _, c := range s {
+		if strings.ContainsAny(string(c), toEscape) {
+			r.WriteRune('\\')
+		}
+		r.WriteRune(c)
+	}
+	return r.String()
 }
