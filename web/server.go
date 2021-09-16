@@ -395,7 +395,7 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 	mode := "Lax"
 	if ok {
 		m := modes[0]
-		if m == "Lax" || m == "Boundary" {
+		if m == "Lax" || m == "Boundary" || m == "Raw" {
 			mode = m
 		}
 	}
@@ -418,12 +418,17 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 
 	fileSites := []fileSites{}
 
-	// See https://github.com/google/zoekt/issues/139 for not wrapping in quotes
-	moddedSelection := escapeLiteralQuery(selection)
-	if mode == "Boundary" {
-		moddedSelection = "\\b" + moddedSelection + "\\b"
+	var rq string
+	if mode == "Raw" {
+		rq = selection
+	} else {
+		// See https://github.com/google/zoekt/issues/139 for not wrapping in quotes
+		moddedSelection := escapeLiteralQuery(selection)
+		if mode == "Boundary" {
+			moddedSelection = "\\b" + moddedSelection + "\\b"
+		}
+		rq = "case:" + casing + " " + moddedSelection
 	}
-	rq := "case:" + casing + " " + moddedSelection
 
 	if err := s.appendSearches(rq, ctx, &fileSites); err != nil {
 		return err
@@ -534,7 +539,7 @@ func (s *Server) appendSearches(rq string, ctx context.Context, manyFileSites *[
 	}
 	sOpts.SetDefaults()
 
-	// Number of files to return - fixed for now.
+	// Number of files to return - fixed for now. TODO: expose as param
 	num := 500
 
 	// BEGIN cargo-cult limiting from zoekt:web/server.go
