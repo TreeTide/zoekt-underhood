@@ -7,6 +7,7 @@ import (
 	//"html"
 	"log"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -299,10 +300,10 @@ type UhXRefReply struct {
 	Refs      []UhSiteGroup `json:"refs"`
 	RefCounts UhRefCounts   `json:"refCounts"`
 	// Below unused by zoekt-underhood, populated to default values.
-	Calls        []string `json:"calls"`
-	CallCount    int      `json:"callCount"`
-	Definitions  []string `json:"definitions"`
-	Declarations []string `json:"declarations"`
+	Calls        []string      `json:"calls"`
+	CallCount    int           `json:"callCount"`
+	Definitions  []string      `json:"definitions"`
+	Declarations []UhSiteGroup `json:"declarations"`
 }
 
 type UhRefCounts struct {
@@ -416,7 +417,7 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 
 	ctx := r.Context()
 
-	fileSites := []fileSites{}
+	manyFileSites := []fileSites{}
 
 	var rq string
 	if mode == "Raw" {
@@ -430,17 +431,17 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 		rq = "case:" + casing + " " + moddedSelection
 	}
 
-	if err := s.appendSearches(rq, ctx, &fileSites); err != nil {
+	if err := s.appendSearches(rq, ctx, &manyFileSites); err != nil {
 		return err
 	}
 	// Note: if the [repo filter] was more precise, we could shoot multiple
 	// well-crafted queries and just concat them. But for now resort to sorting.
-	sort.SliceStable(fileSites, func(i, j int) bool {
-		ti, err := parseTicket(fileSites[i].containingFile.FileTicket)
+	sort.SliceStable(manyFileSites, func(i, j int) bool {
+		ti, err := parseTicket(manyFileSites[i].containingFile.FileTicket)
 		if err != nil {
 			return false
 		}
-		tj, err := parseTicket(fileSites[j].containingFile.FileTicket)
+		tj, err := parseTicket(manyFileSites[j].containingFile.FileTicket)
 		if err != nil {
 			return false
 		}
@@ -464,63 +465,61 @@ func (s *Server) serveSearchXrefErr(w http.ResponseWriter, r *http.Request) erro
 		return false // Keep original order
 	})
 
-	// keyed by file content hash (fileChecksum)
-	seenTickets := map[string]UhDisplayedFile{}
+	// NOTE: rather exploit Zoekt's SYM search functionality to shoot an extra
+	// search and get the syms? This could be client-controlled, or we can
+	// shoot internally (which also helps to remove refs)
+	//
+	// Small nit: SYM doesn't have regex mode, just substring (like repo), so
+	// if we are in boundary mode, should do additional checks ourselves?
 
-	// keyed by match content hash (snippetsHash)
-	contentGroups := map[string][]UhFileSites{}
-	contentGroupOrder := []string{}
+	// For now keep all stuff there, even if some is possibly a decl.
+	// Maybe really split in future? Or just mark in references as possible
+	// decl and let UI hind if wanted?
+	refSites := manyFileSites
 
-	snipCnt := 0
-	fileCnt := 0
-	fileDupCnt := 0
-	matchDupCnt := 0
-	for _, fs := range fileSites {
-		// Dedup
-		var dupTick *UhDisplayedFile = nil
-		if seenTick, ok := seenTickets[string(fs.fileChecksum)]; ok {
-			dupTick = &seenTick
-			fileDupCnt += 1
-		} else {
-			seenTickets[string(fs.fileChecksum)] = fs.containingFile
+	declSites := []fileSites{}
+
+	// Assembly things
+	// re := regexp.MustCompile("^[._\\s]*([a-z]\\.)?" + selection + ":")
+
+	// Haskell:
+	// top-level
+	//  ^foo ::
+	// data types
+	//  ^data Foo\b
+	// data fields
+	//   { foo ::
+	//   , bar ::
+	// sum ctors
+	//   = Foo
+	//   | Bar
+	re := regexp.MustCompile("^((^" + selection + "\\s*($|::))|(\\s+[{,]\\s*" + selection + "\\s*::)|(data\\s+" + selection + "\\b)|(\\s+[=|]\\s*" + selection + "))")
+	for _, fs := range manyFileSites {
+		for _, s := range fs.snippets {
+			if re.MatchString(s.Text) {
+				c := fs
+				// Quick hack - leads to DUPs actually
+				c.snippets = []UhSnippet{s}
+				declSites = append(declSites, c)
+			}
 		}
-		// To content group
-		h := string(fs.snippetsHash)
-		s := UhFileSites{
-			ContainingFile: fs.containingFile,
-			IsDupOf:        dupTick,
-			Snippets:       fs.snippets,
-		}
-		if _, ok := contentGroups[h]; ok {
-			contentGroups[h] = append(contentGroups[h], s)
-			matchDupCnt += 1
-		} else {
-			contentGroups[h] = []UhFileSites{s}
-			contentGroupOrder = append(contentGroupOrder, h)
-		}
-		fileCnt += 1
-		snipCnt += len(fs.snippets)
 	}
 
-	gs := []UhSiteGroup{}
-	for _, h := range contentGroupOrder {
-		gs = append(gs, UhSiteGroup{
-			Files: contentGroups[h],
-		})
-	}
+	rs := groupSites(refSites)
+	ds := groupSites(declSites)
 
 	if err := json.NewEncoder(w).Encode(UhXRefReply{
-		Refs: gs,
+		Refs: rs.groups,
 		RefCounts: UhRefCounts{
-			Lines:      snipCnt,
-			Files:      fileCnt,
-			DupFiles:   fileDupCnt,
-			DupMatches: matchDupCnt,
+			Lines:      rs.snipCnt,
+			Files:      rs.fileCnt,
+			DupFiles:   rs.fileDupCnt,
+			DupMatches: rs.matchDupCnt,
 		},
 		Calls:        []string{},
 		CallCount:    0,
 		Definitions:  []string{},
-		Declarations: []string{},
+		Declarations: ds.groups,
 	}); err != nil {
 		return err
 	}
@@ -587,8 +586,14 @@ func (s *Server) appendSearches(rq string, ctx context.Context, manyFileSites *[
 			firstFrag := l.LineFragments[0]
 			lineNum := l.LineNumber - 1
 			snippetsHash.Write(l.Line)
+			// TODO handle if non-UTF8 etc?
+			clippedLine := string(l.Line)
+			if len(clippedLine) > 250 {
+				// TODO adjust returned line/ch values? or otherwise indicate clip?
+				clippedLine = clippedLine[:30] + "...line too long, clipped..." + clippedLine[len(clippedLine)-30:]
+			}
 			snippet := UhSnippet{
-				Text: string(l.Line), // TODO handle if non-UTF8 etc?
+				Text: clippedLine,
 				// Inventing one based on approximation.
 				FullSpan: CmRange{
 					From: CmPoint{
@@ -623,6 +628,69 @@ func (s *Server) appendSearches(rq string, ctx context.Context, manyFileSites *[
 		})
 	}
 	return nil
+}
+
+type groupResult struct {
+	snipCnt     int
+	fileCnt     int
+	fileDupCnt  int
+	matchDupCnt int
+	groups      []UhSiteGroup
+}
+
+func groupSites(fileSites []fileSites) groupResult {
+	// keyed by file content hash (fileChecksum)
+	seenTickets := map[string]UhDisplayedFile{}
+
+	// keyed by match content hash (snippetsHash)
+	contentGroups := map[string][]UhFileSites{}
+	contentGroupOrder := []string{}
+
+	snipCnt := 0
+	fileCnt := 0
+	fileDupCnt := 0
+	matchDupCnt := 0
+	for _, fs := range fileSites {
+		// Dedup
+		var dupTick *UhDisplayedFile = nil
+		if seenTick, ok := seenTickets[string(fs.fileChecksum)]; ok {
+			dupTick = &seenTick
+			fileDupCnt += 1
+		} else {
+			seenTickets[string(fs.fileChecksum)] = fs.containingFile
+		}
+		// To content group
+		// TODO need to defer calculating snippetHash
+		h := string(fs.snippetsHash)
+		s := UhFileSites{
+			ContainingFile: fs.containingFile,
+			IsDupOf:        dupTick,
+			Snippets:       fs.snippets,
+		}
+		if _, ok := contentGroups[h]; ok {
+			contentGroups[h] = append(contentGroups[h], s)
+			matchDupCnt += 1
+		} else {
+			contentGroups[h] = []UhFileSites{s}
+			contentGroupOrder = append(contentGroupOrder, h)
+		}
+		fileCnt += 1
+		snipCnt += len(fs.snippets)
+	}
+
+	gs := []UhSiteGroup{}
+	for _, h := range contentGroupOrder {
+		gs = append(gs, UhSiteGroup{
+			Files: contentGroups[h],
+		})
+	}
+	return groupResult{
+		snipCnt:     snipCnt,
+		fileCnt:     fileCnt,
+		fileDupCnt:  fileDupCnt,
+		matchDupCnt: matchDupCnt,
+		groups:      gs,
+	}
 }
 
 type ticket struct {
