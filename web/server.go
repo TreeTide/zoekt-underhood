@@ -126,7 +126,10 @@ func (s *Server) serveFileTreeErr(w http.ResponseWriter, r *http.Request) error 
 
 	subtrees := []FileTree{}
 	if topRepo == "" {
-		result, err := s.Searcher.List(ctx, q)
+		opts := zoekt.ListOptions{
+			Minimal: false, // maybe?
+		}
+		result, err := s.Searcher.List(ctx, q, &opts)
 		if err != nil {
 			return err
 		}
