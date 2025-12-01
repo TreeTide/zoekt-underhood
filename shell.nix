@@ -4,5 +4,5 @@
 with pkgs;
 stdenv.mkDerivation {
   name = "dev-shell";
-  buildInputs = [ go_1_16 ];
+  buildInputs = [ go_1_21 ];
 }
